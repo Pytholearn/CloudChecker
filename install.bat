@@ -28,6 +28,7 @@ echo.
 echo   [2/3] Installing dependencies...
 pip install rich --quiet
 pip install autoupgrader --quiet
+pip install gitpython --quiet
 
 echo   Dependencies installed.
 
@@ -36,6 +37,7 @@ echo.
 echo   [3/3] Verifying...
 python -c "from rich.console import Console; print('   Rich: OK')"
 python -c "import autoupgrader; print('   Autoupgrader: OK')"
+python -c "import git; print('   GitPython: OK')"
 
 echo.
 echo   ================================================

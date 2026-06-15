@@ -16,8 +16,9 @@ from rich.live import Live
 
 try:
     import autoupgrader as au
-    au.set_url("https://github.com/Pytholearn/CloudChecker")
+    au.set_url("https://raw.githubusercontent.com/Pytholearn/CloudChecker/main/version.txt")
     au.set_current_version("1.0.0")
+    au.set_download_link("https://github.com/Pytholearn/CloudChecker.git")
 except ImportError:
     au = None
 
@@ -706,12 +707,19 @@ class App:
             if au:
                 try:
                     if not au.is_up_to_date():
+                        latest = au.get_latest_version().strip()
                         cls()
-                        print(f"  {YEL}{BOLD}New version available!{RST}")
-                        print(f"  {DIM}Updating...{RST}")
-                        au.update()
-                        print(f"  {GRN}Updated! Restart to use new version.{RST}")
-                        time.sleep(2)
+                        print(f"  {YEL}{BOLD}New version available! ({VERSION} → {latest}){RST}")
+                        print(f"  {DIM}Update? [y/n]{RST}")
+                        cur_show()
+                        k = _read_key()
+                        cur_hide()
+                        if k in ("y", "Y"):
+                            print(f"  {DIM}Updating via git clone...{RST}")
+                            au.update()
+                        else:
+                            print(f"  {DIM}Skipped.{RST}")
+                            time.sleep(0.5)
                 except: pass
             self._main()
         except KeyboardInterrupt: pass
