@@ -38,8 +38,12 @@
 
 ## Features
 
+- **Asyncio Scan Engine**: Massively concurrent I/O via `asyncio` — faster and lighter than threads
 - **Phase 1 — Connectivity Scan**: Probes thousands of Cloudflare edge IPs via TLS handshake + HTTP `/cdn-cgi/trace` to find reachable ones
-- **Phase 2 — Speed Test**: Downloads 100 KB from `speed.cloudflare.com` on the top 10 candidates to measure real throughput
+- **Phase 2 — Optional Speed Test**: After scan, asks if you want to run download speed test on top 10 candidates (5 parallel workers)
+- **ETA Display**: Shows estimated time remaining during scan based on real-time probe rate
+- **Rescan Failed IPs**: After scan completes, offers to retry all failed IPs to recover any that were temporarily unreachable
+- **IP Geolocation**: Look up country and city for your results — batch queries [ip-api.com](http://ip-api.com), displays results grouped by country
 - **Config Modifier**: Paste a VLESS/Trojan config URL + provide an IP list → generates new configs with each clean IP (like [v2ray-config-modifier](https://seramo.github.io/v2ray-config-modifier/))
 - **Custom Range Scan**: Scan any CIDR range or IP list — not limited to official Cloudflare ranges
 - **Max Latency Filter**: Skip IPs above a configurable latency threshold (200ms / 500ms / 1000ms / custom)
@@ -98,8 +102,9 @@ python CloudChecker.py
 | **Ports** | 443, 8443, 2053, 2083, 2087, 2096 | 443 |
 
 4. Press **Enter** to start scanning
-5. Watch live results — press **q** to stop early
-6. After scan: copy best IP, export CSV/JSON, save to `ips.txt`
+5. Watch live results with ETA countdown — press **q** to stop early
+6. After scan: optionally rescan failed IPs, then choose whether to run speed test
+7. View results: copy best IP, export CSV/JSON, save to `ips.txt`, or run **Geolocation** lookup
 
 ### 2. Config Modifier
 
@@ -151,16 +156,25 @@ Select **Custom Range** as source in scan settings, then enter CIDR ranges or IP
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────┐
-│  Generate /  │────▶│  Phase 1:    │────▶│  Neighbor   │────▶│ Phase 2: │
-│  Load IPs    │     │  TLS Probe   │     │  Scan ±12   │     │ Speed    │
-│              │     │  /cdn-cgi/   │     │  around top │     │ Test     │
-│              │     │  trace       │     │  5 IPs      │     │ top 10   │
+│  Generate /  │────▶│  Phase 1:    │────▶│  Neighbor   │────▶│  Rescan  │
+│  Load IPs    │     │  TLS Probe   │     │  Scan ±12   │     │  Failed? │
+│  (asyncio)   │     │  /cdn-cgi/   │     │  around top │     │  [y/n]   │
+│              │     │  trace + ETA │     │  5 IPs      │     │          │
 └─────────────┘     └──────────────┘     └─────────────┘     └──────────┘
                           │                                        │
                           ▼                                        ▼
-                    Filter by:                              Sort by speed
-                    - max latency                           & latency
-                    - connectivity
+                    Filter by:                              ┌──────────┐
+                    - max latency                           │  Speed   │
+                    - connectivity                          │  Test?   │
+                                                            │  [y/n]   │
+                                                            └──────────┘
+                                                                   │
+                                                                   ▼
+                                                            ┌──────────┐
+                                                            │ Results  │
+                                                            │ + Geo    │
+                                                            │ lookup   │
+                                                            └──────────┘
 ```
 
 ---
@@ -173,6 +187,19 @@ Settings are saved to:
 - **Linux:** `~/.config/cloudchecker/config.json`
 
 Cloudflare IP ranges are cached in the same directory and refreshed every 24 hours.
+
+---
+
+## What's New in v2.0.0
+
+| Change | Description |
+|--------|-------------|
+| **Asyncio engine** | Scan engine rewritten from `ThreadPoolExecutor` to `asyncio` — uses `asyncio.open_connection` with SSL, `Semaphore` for concurrency, `gather` for parallel probing. Lower overhead, faster scanning. |
+| **ETA display** | Shows estimated time remaining during scan (e.g. `ETA: 2m30s`). Calculates from real-time probe rate after 20 samples. |
+| **Rescan failed** | After Phase 1, prompts: *"X IPs failed. Rescan them? [y/n]"*. Retries unique failed IPs and merges recovered results. |
+| **Optional speed test** | Speed test no longer runs automatically. Prompts: *"Run download speed test on top 10? [y/n]"*. Runs with 5 async parallel workers. |
+| **IP Geolocation** | New option in results menu. Choose how many IPs to look up → batch queries `ip-api.com` → scrollable table grouped by country with city, latency, and speed. |
+| **Network improvements** | TCP pre-filter removed (asyncio handles timeouts natively), connect timeout reduced to 1.5s, proper async cleanup with `wait_closed()`, neighbor scan runs async. |
 
 ---
 
@@ -214,8 +241,12 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ## امکانات
 
+- **موتور Asyncio**: اسکن فوق سریع با `asyncio` — سبک‌تر و سریع‌تر از thread
 - **فاز ۱ — اسکن اتصال**: هزاران آیپی لبه کلادفلر رو از طریق TLS + HTTP تست میکنه
-- **فاز ۲ — تست سرعت**: سرعت دانلود واقعی ۱۰ آیپی برتر رو اندازه میگیره
+- **فاز ۲ — تست سرعت (اختیاری)**: بعد اسکن میپرسه آیا تست سرعت بزنه یا نه (۵ ورکر موازی)
+- **ETA / زمان تقریبی**: حین اسکن، زمان باقی‌مونده رو نشون میده
+- **اسکن مجدد خراب‌ها**: بعد اسکن میپرسه آیا آیپی‌های خراب رو دوباره تست کنه
+- **موقعیت جغرافیایی (Geolocation)**: آیپی‌ها رو بر اساس کشور و شهر دسته‌بندی میکنه
 - **تغییر کانفیگ**: کانفیگ VLESS/Trojan رو با آیپی‌های تمیز ترکیب میکنه (مثل سایت seramo)
 - **اسکن رنج دلخواه**: هر CIDR یا آیپی دلخواهی رو میتونی اسکن کنی
 - **فیلتر لیتنسی**: آیپی‌های کند رو حذف کن (۲۰۰/۵۰۰/۱۰۰۰ میلی‌ثانیه)
@@ -274,8 +305,9 @@ python CloudChecker.py
 | **پورت‌ها** | 443, 8443, 2053, 2083, 2087, 2096 | 443 |
 
 4. **Enter** بزن تا اسکن شروع بشه
-5. نتایج زنده رو ببین — **q** بزن برای توقف
-6. بعد از اسکن: کپی بهترین آیپی، خروجی CSV/JSON، ذخیره در `ips.txt`
+5. نتایج زنده رو با شمارش معکوس ETA ببین — **q** بزن برای توقف
+6. بعد از اسکن: اسکن مجدد خراب‌ها (اختیاری) → تست سرعت (اختیاری)
+7. نتایج: کپی بهترین آیپی، خروجی CSV/JSON، ذخیره در `ips.txt`، یا **Geolocation**
 
 ### ۲. تغییر کانفیگ
 
@@ -327,12 +359,32 @@ python CloudChecker.py
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────┐
-│ ساخت / لود  │────▶│   فاز ۱:     │────▶│   اسکن      │────▶│  فاز ۲:  │
-│   آیپی‌ها    │     │   پروب TLS   │     │   همسایه    │     │   تست    │
-│              │     │  /cdn-cgi/   │     │   ±۱۲ آیپی  │     │   سرعت   │
-│              │     │   trace      │     │   اطراف ۵   │     │  ۱۰ برتر │
+│ ساخت / لود  │────▶│   فاز ۱:     │────▶│   اسکن      │────▶│  اسکن   │
+│   آیپی‌ها    │     │  پروب TLS   │     │   همسایه    │     │  مجدد   │
+│  (asyncio)   │     │  /cdn-cgi/   │     │   ±۱۲ آیپی  │     │ خراب‌ها؟ │
+│              │     │ trace + ETA  │     │   اطراف ۵   │     │  [y/n]   │
 └─────────────┘     └──────────────┘     └─────────────┘     └──────────┘
+                                                                   │
+                                                                   ▼
+                          ┌──────────┐                       ┌──────────┐
+                          │  نتایج   │◀──────────────────────│   تست    │
+                          │  + Geo   │                       │  سرعت؟   │
+                          │          │                       │  [y/n]   │
+                          └──────────┘                       └──────────┘
 ```
+
+---
+
+## تغییرات نسخه ۲.۰.۰
+
+| تغییر | توضیحات |
+|-------|---------|
+| **موتور Asyncio** | موتور اسکن از `ThreadPoolExecutor` به `asyncio` تغییر کرد — سریع‌تر و سبک‌تر |
+| **ETA / زمان تقریبی** | حین اسکن زمان باقی‌مونده نمایش داده میشه (مثلاً `ETA: 2m30s`) |
+| **اسکن مجدد خراب‌ها** | بعد فاز ۱ میپرسه: آیپی‌های خراب رو دوباره تست کنم؟ |
+| **تست سرعت اختیاری** | تست سرعت دیگه خودکار نیست — بعد اسکن میپرسه میخوای تست سرعت بزنم؟ |
+| **موقعیت جغرافیایی** | گزینه جدید تو نتایج — آیپی‌ها رو بر اساس کشور و شهر دسته‌بندی میکنه |
+| **بهبود شبکه** | حذف TCP pre-filter، کاهش تایم‌اوت اتصال به ۱.۵ ثانیه، اسکن همسایه async |
 
 ---
 

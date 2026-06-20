@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Cloud Checker — Cloudflare IP Scanner for restricted networks."""
 
-import socket, ssl, time, random, ipaddress, os, sys, io, threading
+import socket, ssl, time, random, ipaddress, os, sys, io, threading, asyncio
 import statistics, json, re, subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import parse_qs, unquote
 import urllib.request
@@ -17,12 +16,12 @@ from rich.live import Live
 try:
     import autoupgrader as au
     au.set_url("https://raw.githubusercontent.com/Pytholearn/CloudChecker/main/version.txt")
-    au.set_current_version("1.0.0")
+    au.set_current_version("2.0.0")
     au.set_download_link("https://github.com/Pytholearn/CloudChecker.git")
 except ImportError:
     au = None
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 GITHUB = "github.com/Pytholearn"
 console = Console()
 
@@ -272,102 +271,95 @@ class IPSource:
         return ips
 
 # ─── Prober ───────────────────────────────────────────────────────
+_COLO_RE = re.compile(rb"colo=([A-Z]{3})")
+SPEED_BYTES = 1048576  # 1 MB for accurate speed test
+
 class Prober:
     def __init__(self, timeout=5, tries=1, sni=None):
         self.timeout = timeout; self.tries = tries; self.sni = sni
         self._ctx = ssl.create_default_context()
+        self._sni = sni or "speed.cloudflare.com"
+        self._req = f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {self._sni}\r\nConnection: close\r\n\r\n".encode()
+        self._ct = min(timeout, 1.5)
 
-    def probe(self, ip, port):
+    async def probe(self, ip, port):
         r = Result(ip, port)
-        sni = self.sni or "speed.cloudflare.com"
-        req = f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n".encode()
-        for _ in range(self.tries):
-            r.total += 1
-            s = None
+        r.total = 1
+        try:
+            t0 = time.perf_counter()
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port, ssl=self._ctx,
+                                       server_hostname=self._sni),
+                timeout=self.timeout)
+            writer.write(self._req)
+            await writer.drain()
+            buf = b""
             try:
-                t0 = time.perf_counter()
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(self.timeout)
-                s.connect((ip, port))
-                ss = self._ctx.wrap_socket(s, server_hostname=sni)
-                ss.sendall(req)
-                ss.settimeout(2)
-                buf = b""
                 for _ in range(4):
-                    try:
-                        c = ss.recv(4096)
-                        if not c: break
-                        buf += c
-                        if b"colo=" in buf: break
-                    except (socket.timeout, ssl.SSLError): break
-                ms = (time.perf_counter()-t0)*1000
-                r.latencies.append(ms)
-                txt = buf.decode("utf-8", errors="ignore")
-                m = re.search(r"colo=([A-Z]{3})", txt)
-                if m: r.colo = m.group(1)
-                ss.close()
-            except: r.failed += 1
-            finally:
-                if s:
-                    try: s.close()
-                    except: pass
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=1.5)
+                    if not chunk: break
+                    buf += chunk
+                    if b"colo=" in buf: break
+            except asyncio.TimeoutError:
+                pass
+            ms = (time.perf_counter() - t0) * 1000
+            r.latencies.append(ms)
+            m = _COLO_RE.search(buf)
+            if m: r.colo = m.group(1).decode()
+            writer.close()
+            try: await writer.wait_closed()
+            except: pass
+        except:
+            r.failed = 1
         return r
 
-    def speed_test(self, ip, port):
-        sni = self.sni or "speed.cloudflare.com"
-        s = None
+    async def speed_test(self, ip, port):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(10)
-            s.connect((ip, port))
-            ss = self._ctx.wrap_socket(s, server_hostname=sni)
-            req = f"GET /__down?bytes=102400 HTTP/1.1\r\nHost: speed.cloudflare.com\r\nConnection: close\r\n\r\n"
-            ss.sendall(req.encode())
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port, ssl=self._ctx,
+                                       server_hostname=self._sni),
+                timeout=10)
+            req = f"GET /__down?bytes={SPEED_BYTES} HTTP/1.1\r\nHost: speed.cloudflare.com\r\nConnection: close\r\n\r\n"
+            writer.write(req.encode())
+            await writer.drain()
             t0 = time.perf_counter()
             total_bytes = 0
             while True:
                 try:
-                    c = ss.recv(8192)
-                    if not c: break
-                    total_bytes += len(c)
-                except: break
+                    chunk = await asyncio.wait_for(reader.read(16384), timeout=5)
+                    if not chunk: break
+                    total_bytes += len(chunk)
+                except asyncio.TimeoutError: break
             elapsed = time.perf_counter() - t0
-            ss.close()
+            writer.close()
+            try: await writer.wait_closed()
+            except: pass
             return (total_bytes / elapsed / 1024) if elapsed > 0 else 0
-        except: return 0
-        finally:
-            if s:
-                try: s.close()
-                except: pass
+        except:
+            return 0
 
 # ─── Engine ───────────────────────────────────────────────────────
 class Engine:
     def __init__(self, workers=50, prober=None):
         self.w = workers; self.prober = prober or Prober()
         self.tested = 0; self.healthy = 0; self.failed = 0
-        self._lock = threading.Lock(); self._stop = threading.Event()
-    def stop(self): self._stop.set()
+        self._stop = False
+    def stop(self): self._stop = True
     @property
-    def stopped(self): return self._stop.is_set()
-    def scan(self, ips, ports, on_result=None):
-        tasks = [(ip, p) for ip in ips for p in ports]
-        total = len(tasks)
-        with ThreadPoolExecutor(max_workers=self.w) as pool:
-            futs = {}
-            for ip, p in tasks:
-                if self._stop.is_set(): break
-                futs[pool.submit(self.prober.probe, ip, p)] = (ip, p)
-            for f in as_completed(futs):
-                if self._stop.is_set(): break
-                try:
-                    r = f.result()
-                    with self._lock:
-                        self.tested += 1
-                        if r.ok: self.healthy += 1
-                        else: self.failed += 1
-                    if on_result: on_result(r, self.tested, total)
-                except:
-                    with self._lock: self.tested += 1; self.failed += 1
+    def stopped(self): return self._stop
+    async def scan(self, ips, ports, on_result=None):
+        sem = asyncio.Semaphore(self.w)
+        async def _one(ip, port):
+            if self._stop: return
+            async with sem:
+                if self._stop: return
+                r = await self.prober.probe(ip, port)
+                self.tested += 1
+                if r.ok: self.healthy += 1
+                else: self.failed += 1
+                if on_result: on_result(r)
+        tasks = [_one(ip, p) for ip in ips for p in ports]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 # ─── Clipboard ────────────────────────────────────────────────────
 def copy_clip(text):
@@ -625,6 +617,16 @@ def _scan_panel(engine, top, total, ports, sni, t0, wpath, si):
     hdr.append("Phase 1 — Finding reachable IPs", style="bold yellow")
     if sni: hdr.append(f"  SNI: {sni}", style="dim")
 
+    if engine.tested > 20 and elapsed > 2:
+        rate = engine.tested / elapsed
+        rem = (total - engine.tested) / rate
+        if rem > 60: eta = f"{int(rem//60)}m{int(rem%60):02d}s"
+        else: eta = f"{rem:.0f}s"
+    elif engine.tested > 0:
+        eta = "calculating..."
+    else:
+        eta = "--"
+
     st = RText()
     st.append(f"\n  tested: ", style="white")
     st.append(f"{engine.tested}", style="bold")
@@ -632,7 +634,8 @@ def _scan_panel(engine, top, total, ports, sni, t0, wpath, si):
     st.append(f"{engine.healthy}", style="bold green")
     st.append(f"  failed: ", style="white")
     st.append(f"{engine.failed}", style="dim red")
-    st.append(f"  target: {total}  {elapsed:.0f}s", style="dim")
+    st.append(f"  target: {total}  {elapsed:.0f}s  ", style="dim")
+    st.append(f"ETA: {eta}", style="bold yellow")
 
     bar = ProgressBar(total=total, completed=engine.tested, width=50,
                       complete_style="cyan", finished_style="bold green")
@@ -846,23 +849,29 @@ class App:
 
     # ── Live scan ─────────────────────────────────────────────────
 
+    def _run_async(self, coro):
+        loop = asyncio.new_event_loop()
+        try: return loop.run_until_complete(coro)
+        finally: loop.close()
+
     def _do_scan(self, ips, ports, workers, timeout, max_lat):
         sni = self.pcfg.sni if self.pcfg else None
         prober = Prober(timeout, 1, sni)
         engine = Engine(workers, prober)
         total = len(ips) * len(ports)
-        healthy = []; h_lock = threading.Lock()
+        healthy = []; failed_list = []; h_lock = threading.Lock()
         self.writer = LiveWriter()
 
-        def on_result(r, tested, tot):
+        def on_result(r):
             if r.ok:
-                if max_lat > 0 and r.avg > max_lat:
-                    return
+                if max_lat > 0 and r.avg > max_lat: return
                 with h_lock: healthy.append(r)
+            else:
+                with h_lock: failed_list.append(r)
 
         scan_done = threading.Event()
         def worker():
-            engine.scan(ips, ports, on_result)
+            self._run_async(engine.scan(ips, ports, on_result))
             scan_done.set()
 
         t = threading.Thread(target=worker, daemon=True)
@@ -888,33 +897,93 @@ class App:
 
         # Neighbor scan
         with h_lock: top_all = sorted(healthy, key=lambda x: x.avg)
-        if self.cfg["neighbor"] and top_all:
+        if self.cfg["neighbor"] and top_all and not engine.stopped:
             nb = set(); existing = {r.ip for r in top_all}
             for r in top_all[:5]:
                 for n in self.ips.neighbors(r.ip):
                     if n not in existing: nb.add(n)
-            if nb and not engine.stopped:
+            if nb:
                 nb_eng = Engine(workers, prober)
-                def on_nb(r, tested, tot):
+                def on_nb(r):
                     if r.ok and (max_lat <= 0 or r.avg <= max_lat):
                         with h_lock: healthy.append(r)
-                nb_eng.scan(list(nb), ports, on_nb)
+                nb_done = threading.Event()
+                def nb_worker():
+                    self._run_async(nb_eng.scan(list(nb), ports, on_nb))
+                    nb_done.set()
+                nb_t = threading.Thread(target=nb_worker, daemon=True)
+                nb_t.start(); nb_done.wait(timeout=30)
 
         with h_lock:
             final = sorted(healthy, key=lambda x: x.avg)
 
-        # Phase 2: speed test on top 10
+        # Rescan failed IPs?
+        if failed_list and not engine.stopped:
+            cls(); print(banner_str(small=True))
+            nf = len(failed_list)
+            print(f"\n  {YEL}{BOLD}{nf} IPs failed.{RST} Rescan them? {DIM}[y/n]{RST}")
+            cur_show(); k = _read_key(); cur_hide()
+            if k in ("y", "Y"):
+                retry_ips = list({r.ip for r in failed_list})
+                retry_eng = Engine(workers, prober)
+                retry_healthy = []
+                def on_retry(r):
+                    if r.ok and (max_lat <= 0 or r.avg <= max_lat):
+                        retry_healthy.append(r)
+                retry_done = threading.Event()
+                def retry_worker():
+                    self._run_async(retry_eng.scan(retry_ips, ports, on_retry))
+                    retry_done.set()
+                rt = threading.Thread(target=retry_worker, daemon=True)
+                rt.start(); cur_show()
+                try:
+                    with Live(console=console, refresh_per_second=4, transient=True) as live:
+                        rtot = len(retry_ips) * len(ports)
+                        while not retry_done.is_set():
+                            p = retry_eng.tested
+                            live.update(RText(
+                                f"  Rescanning... {p}/{rtot}  "
+                                f"found: {retry_eng.healthy}",
+                                style="yellow"))
+                            time.sleep(0.2)
+                except: pass
+                finally: cur_hide()
+                retry_done.wait(timeout=2)
+                final.extend(retry_healthy)
+                final.sort(key=lambda x: x.avg)
+
+        # Optional speed test
         if final and not engine.stopped:
-            speed_targets = final[:10]
-            cur_show()
-            try:
-                with Live(console=console, refresh_per_second=4, transient=True) as live:
-                    for idx, r in enumerate(speed_targets):
-                        live.update(_speed_panel(idx, len(speed_targets), r.ep))
-                        r.speed = prober.speed_test(r.ip, r.port)
-            except: pass
-            finally: cur_hide()
-            final.sort(key=lambda x: (-x.speed, x.avg))
+            cls(); print(banner_str(small=True))
+            print(f"\n  {GRN}{BOLD}{len(final)} healthy IPs found.{RST}")
+            print(f"  Run download speed test on top 10? {DIM}[y/n]{RST}")
+            cur_show(); k = _read_key(); cur_hide()
+            if k in ("y", "Y"):
+                speed_targets = final[:10]
+                done_count = [0]
+                async def _speed_batch():
+                    sem = asyncio.Semaphore(5)
+                    async def _test(r):
+                        async with sem:
+                            r.speed = await prober.speed_test(r.ip, r.port)
+                            done_count[0] += 1
+                    await asyncio.gather(*[_test(r) for r in speed_targets])
+                speed_done = threading.Event()
+                def speed_worker():
+                    self._run_async(_speed_batch())
+                    speed_done.set()
+                st = threading.Thread(target=speed_worker, daemon=True)
+                st.start(); cur_show()
+                try:
+                    with Live(console=console, refresh_per_second=4, transient=True) as live:
+                        while not speed_done.is_set():
+                            live.update(_speed_panel(done_count[0], len(speed_targets),
+                                        f"{done_count[0]}/{len(speed_targets)} parallel"))
+                            time.sleep(0.3)
+                except: pass
+                finally: cur_hide()
+                speed_done.wait(timeout=2)
+                final.sort(key=lambda x: (-x.speed, x.avg))
 
         self.last_results = final
         self.writer.write(final)
@@ -926,7 +995,7 @@ class App:
     def _show_results(self, results, elapsed, engine):
         idx = 0
         items = ["Copy best IP", "Save ips.txt", "Export CSV", "Export JSON",
-                 "Sort by Avg", "Sort by Speed", "Sort by Colo", "Back"]
+                 "Geolocation", "Sort by Avg", "Sort by Speed", "Sort by Colo", "Back"]
         while True:
             console.clear()
             console.print(f"  [bold green]⚡ Scan complete[/]  [dim]{elapsed:.1f}s  "
@@ -965,10 +1034,12 @@ class App:
                     p = f"CloudChecker-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
                     export_json(results, p)
                     self._flash(f"{GRN}✓ Exported {p}{RST}")
-                elif idx == 4: results.sort(key=lambda r: r.avg if r.avg > 0 else 9e9)
-                elif idx == 5: results.sort(key=lambda r: -r.speed)
-                elif idx == 6: results.sort(key=lambda r: r.colo)
-                elif idx == 7: return
+                elif idx == 4:
+                    self._geolocation(results)
+                elif idx == 5: results.sort(key=lambda r: r.avg if r.avg > 0 else 9e9)
+                elif idx == 6: results.sort(key=lambda r: -r.speed)
+                elif idx == 7: results.sort(key=lambda r: r.colo)
+                elif idx == 8: return
             elif k in ("q", "Q", "ESC"): return
 
     # ── Config Modifier ──────────────────────────────────────────
@@ -1047,6 +1118,104 @@ class App:
                     self._flash(f"{RED}Clipboard not available{RST}")
             elif k in ("q", "Q", "ESC"): return
 
+    # ── Geolocation ────────────────────────────────────────────────
+
+    def _geolocation(self, results):
+        ok = [r for r in results if r.ok]
+        if not ok:
+            self._msg(f"{RED}No healthy results for geolocation{RST}"); return
+
+        cls(); print(banner_str(small=True))
+        print(f"  {BOLD}Geolocation{RST}")
+        print(f"  {DIM}How many IPs to look up? (max {len(ok)}){RST}\n")
+        cur_show()
+        try:
+            raw = input(f"  {CYN}▶{RST} ").strip()
+            n = int(raw) if raw else min(20, len(ok))
+        except: n = min(20, len(ok))
+        cur_hide()
+        n = max(1, min(n, len(ok)))
+
+        targets = ok[:n]
+        geo = {}
+        cls(); print(banner_str(small=True))
+        print(f"  {YEL}Looking up {n} IPs...{RST}")
+        sys.stdout.flush()
+
+        try:
+            ips = [r.ip for r in targets]
+            for i in range(0, len(ips), 100):
+                batch = ips[i:i+100]
+                payload = json.dumps([{"query": ip,
+                    "fields": "country,countryCode,city,query,status"}
+                    for ip in batch])
+                req = urllib.request.Request(
+                    "http://ip-api.com/batch",
+                    data=payload.encode(),
+                    headers={"Content-Type": "application/json"})
+                resp = urllib.request.urlopen(req, timeout=15)
+                data = json.loads(resp.read())
+                for item in data:
+                    if item.get("status") == "success":
+                        geo[item["query"]] = {
+                            "country": item.get("country", "Unknown"),
+                            "code": item.get("countryCode", ""),
+                            "city": item.get("city", "")}
+                time.sleep(0.5)
+        except Exception as e:
+            self._msg(f"{RED}Geolocation failed: {e}{RST}"); return
+
+        by_country = {}
+        for r in targets:
+            info = geo.get(r.ip, {"country": "Unknown", "code": "??", "city": ""})
+            country = info["country"]
+            by_country.setdefault(country, []).append((r, info))
+
+        self._show_geo(by_country)
+
+    def _show_geo(self, by_country):
+        scroll = 0
+        total_ips = sum(len(v) for v in by_country.values())
+        countries = sorted(by_country.keys())
+        rows = []
+        for country in countries:
+            entries = by_country[country]
+            for i, (r, info) in enumerate(entries):
+                rows.append((country if i == 0 else "", r, info))
+
+        while True:
+            console.clear()
+            console.print(f"  [bold yellow]Geolocation Results "
+                          f"({total_ips} IPs, {len(countries)} countries)[/]\n")
+
+            tbl = RTable(show_header=True, header_style="bold white",
+                         border_style="dim", show_edge=True, padding=(0, 1),
+                         min_width=70)
+            tbl.add_column("Country", style="bold yellow", min_width=20)
+            tbl.add_column("IP", style="cyan", min_width=18)
+            tbl.add_column("City", style="dim", min_width=12)
+            tbl.add_column("Avg(ms)", justify="right", min_width=9)
+            tbl.add_column("Speed", justify="right", min_width=10)
+
+            visible = rows[scroll:scroll+18]
+            for ctry, r, info in visible:
+                ac = "green" if r.avg < 200 else "yellow" if r.avg < 500 else "red"
+                spd = f"{r.speed:.0f} KB/s" if r.speed > 0 else "-"
+                tbl.add_row(ctry, r.ip, info.get("city", ""),
+                            f"[{ac}]{r.avg:.0f}[/{ac}]", spd)
+            if not visible:
+                tbl.add_row("[dim]no data[/]", "", "", "", "")
+
+            console.print(tbl)
+            console.print(f"\n  [dim]{scroll+1}-{min(scroll+18, len(rows))}"
+                          f" of {len(rows)}[/]")
+            console.print(f"  [dim]\\[up/dn] scroll  \\[q] back[/]")
+
+            k = _read_key()
+            if k == "UP": scroll = max(0, scroll - 1)
+            elif k == "DOWN": scroll = min(max(0, len(rows) - 18), scroll + 1)
+            elif k in ("q", "Q", "ESC"): return
+
     # ── About ─────────────────────────────────────────────────────
 
     def _about(self):
@@ -1055,13 +1224,15 @@ class App:
         print(f"  Cloudflare IP scanner for restricted networks.")
         print(f"  Finds working edge IPs and tests download speed.\n")
         print(f"  {BOLD}Features:{RST}")
-        print(f"  • Phase 1: fast connectivity scan (TLS + HTTP)")
-        print(f"  • Phase 2: download speed test on best IPs")
+        print(f"  • Asyncio-powered scan engine (fast concurrent probing)")
+        print(f"  • ETA / estimated time remaining during scan")
+        print(f"  • Rescan failed IPs after scan completes")
+        print(f"  • Optional download speed test on best IPs")
+        print(f"  • IP Geolocation — group results by country")
         print(f"  • Config modifier: generate V2Ray configs with clean IPs")
         print(f"  • Max latency threshold filter")
         print(f"  • Export: CSV, JSON, plain IP list")
         print(f"  • Auto-update Cloudflare IP ranges from cloudflare.com")
-        print(f"  • Copy best IP to clipboard")
         print(f"  • Automatic neighbor scanning")
         print(f"  • Persistent settings\n")
         print(f"  {ORA}{BOLD}made by hazard{RST}")
