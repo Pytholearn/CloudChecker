@@ -915,7 +915,7 @@ class App:
                 nb_t.start(); nb_done.wait(timeout=30)
 
         with h_lock:
-            final = sorted(healthy, key=lambda x: x.avg)
+            final = list(healthy)
 
         # Rescan failed IPs?
         if failed_list and not engine.stopped:
@@ -926,10 +926,10 @@ class App:
             if k in ("y", "Y"):
                 retry_ips = list({r.ip for r in failed_list})
                 retry_eng = Engine(workers, prober)
-                retry_healthy = []
+                recovered = []
                 def on_retry(r):
                     if r.ok and (max_lat <= 0 or r.avg <= max_lat):
-                        retry_healthy.append(r)
+                        recovered.append(r)
                 retry_done = threading.Event()
                 def retry_worker():
                     self._run_async(retry_eng.scan(retry_ips, ports, on_retry))
@@ -949,42 +949,15 @@ class App:
                 except: pass
                 finally: cur_hide()
                 retry_done.wait(timeout=2)
-                final.extend(retry_healthy)
-                final.sort(key=lambda x: x.avg)
+                if recovered:
+                    existing = {r.ip for r in final}
+                    for r in recovered:
+                        if r.ip not in existing:
+                            final.append(r)
+                            existing.add(r.ip)
+                    engine.healthy += len([r for r in recovered if r.ip not in {x.ip for x in healthy}])
 
-        # Optional speed test
-        if final and not engine.stopped:
-            cls(); print(banner_str(small=True))
-            print(f"\n  {GRN}{BOLD}{len(final)} healthy IPs found.{RST}")
-            print(f"  Run download speed test on top 10? {DIM}[y/n]{RST}")
-            cur_show(); k = _read_key(); cur_hide()
-            if k in ("y", "Y"):
-                speed_targets = final[:10]
-                done_count = [0]
-                async def _speed_batch():
-                    sem = asyncio.Semaphore(5)
-                    async def _test(r):
-                        async with sem:
-                            r.speed = await prober.speed_test(r.ip, r.port)
-                            done_count[0] += 1
-                    await asyncio.gather(*[_test(r) for r in speed_targets])
-                speed_done = threading.Event()
-                def speed_worker():
-                    self._run_async(_speed_batch())
-                    speed_done.set()
-                st = threading.Thread(target=speed_worker, daemon=True)
-                st.start(); cur_show()
-                try:
-                    with Live(console=console, refresh_per_second=4, transient=True) as live:
-                        while not speed_done.is_set():
-                            live.update(_speed_panel(done_count[0], len(speed_targets),
-                                        f"{done_count[0]}/{len(speed_targets)} parallel"))
-                            time.sleep(0.3)
-                except: pass
-                finally: cur_hide()
-                speed_done.wait(timeout=2)
-                final.sort(key=lambda x: (-x.speed, x.avg))
-
+        final.sort(key=lambda x: x.avg)
         self.last_results = final
         self.writer.write(final)
         elapsed = time.time() - t0
@@ -995,11 +968,12 @@ class App:
     def _show_results(self, results, elapsed, engine):
         idx = 0
         items = ["Copy best IP", "Save ips.txt", "Export CSV", "Export JSON",
-                 "Geolocation", "Sort by Avg", "Sort by Speed", "Sort by Colo", "Back"]
+                 "Speed Test", "Geolocation",
+                 "Sort by Avg", "Sort by Speed", "Sort by Colo", "Back"]
         while True:
             console.clear()
             console.print(f"  [bold green]⚡ Scan complete[/]  [dim]{elapsed:.1f}s  "
-                          f"Tested:{engine.tested}  Healthy:{engine.healthy}  "
+                          f"Tested:{engine.tested}  Healthy:{len(results)}  "
                           f"Failed:{engine.failed}[/]")
             console.print(f"  [dim]Results: {self.writer.path}[/]\n")
 
@@ -1035,11 +1009,13 @@ class App:
                     export_json(results, p)
                     self._flash(f"{GRN}✓ Exported {p}{RST}")
                 elif idx == 4:
+                    self._speed_test_page(results)
+                elif idx == 5:
                     self._geolocation(results)
-                elif idx == 5: results.sort(key=lambda r: r.avg if r.avg > 0 else 9e9)
-                elif idx == 6: results.sort(key=lambda r: -r.speed)
-                elif idx == 7: results.sort(key=lambda r: r.colo)
-                elif idx == 8: return
+                elif idx == 6: results.sort(key=lambda r: r.avg if r.avg > 0 else 9e9)
+                elif idx == 7: results.sort(key=lambda r: -r.speed)
+                elif idx == 8: results.sort(key=lambda r: r.colo)
+                elif idx == 9: return
             elif k in ("q", "Q", "ESC"): return
 
     # ── Config Modifier ──────────────────────────────────────────
@@ -1116,6 +1092,111 @@ class App:
                     self._flash(f"{GRN}✓ Copied {len(configs)} configs{RST}")
                 else:
                     self._flash(f"{RED}Clipboard not available{RST}")
+            elif k in ("q", "Q", "ESC"): return
+
+    # ── Speed Test Page ─────────────────────────────────────────────
+
+    def _speed_test_page(self, results):
+        ok = [r for r in results if r.ok]
+        if not ok:
+            self._msg(f"{RED}No healthy results for speed test{RST}"); return
+
+        cls(); print(banner_str(small=True))
+        print(f"  {BOLD}Speed Test{RST}")
+        print(f"  {DIM}How many IPs to test? (max {len(ok)}){RST}\n")
+        cur_show()
+        try:
+            raw = input(f"  {CYN}▶{RST} ").strip()
+            n = int(raw) if raw else min(10, len(ok))
+        except: n = min(10, len(ok))
+        cur_hide()
+        n = max(1, min(n, len(ok)))
+
+        targets = ok[:n]
+        sni = self.pcfg.sni if self.pcfg else None
+        prober = Prober(self.cfg["timeout"], 1, sni)
+        done_count = [0]
+
+        async def _batch():
+            sem = asyncio.Semaphore(5)
+            async def _test(r):
+                async with sem:
+                    r.speed = await prober.speed_test(r.ip, r.port)
+                    done_count[0] += 1
+            await asyncio.gather(*[_test(r) for r in targets])
+
+        speed_done = threading.Event()
+        def speed_worker():
+            self._run_async(_batch())
+            speed_done.set()
+
+        st = threading.Thread(target=speed_worker, daemon=True)
+        st.start(); cur_show()
+        try:
+            with Live(console=console, refresh_per_second=4, transient=True) as live:
+                while not speed_done.is_set():
+                    live.update(_speed_panel(done_count[0], n,
+                                f"{done_count[0]}/{n} parallel"))
+                    time.sleep(0.3)
+        except: pass
+        finally: cur_hide()
+        speed_done.wait(timeout=2)
+
+        targets.sort(key=lambda x: (-x.speed, x.avg))
+        self._show_speed_results(targets)
+
+    def _show_speed_results(self, results):
+        scroll = 0
+        while True:
+            console.clear()
+            console.print(f"  [bold yellow]Speed Test Results ({len(results)} IPs)[/]\n")
+
+            tbl = RTable(show_header=True, header_style="bold white",
+                         border_style="dim", show_edge=True, padding=(0, 1),
+                         min_width=70)
+            tbl.add_column("#", style="dim", width=4, justify="right")
+            tbl.add_column("IP", style="cyan", min_width=18)
+            tbl.add_column("Port", style="dim", min_width=6)
+            tbl.add_column("Avg(ms)", justify="right", min_width=9)
+            tbl.add_column("Colo", justify="right", min_width=6, style="bold magenta")
+            tbl.add_column("Speed", justify="right", min_width=12)
+
+            visible = results[scroll:scroll+15]
+            for i, r in enumerate(visible, scroll+1):
+                ac = "green" if r.avg < 200 else "yellow" if r.avg < 500 else "red"
+                spd = f"{r.speed:.0f} KB/s" if r.speed > 0 else "-"
+                sc = "bold green" if r.speed > 500 else "yellow" if r.speed > 100 else "dim"
+                tbl.add_row(str(i), r.ip, str(r.port),
+                            f"[{ac}]{r.avg:.0f}[/{ac}]",
+                            r.colo or "-", f"[{sc}]{spd}[/{sc}]")
+            if not visible:
+                tbl.add_row("[dim]no data[/]", "", "", "", "", "")
+
+            console.print(tbl)
+            console.print(f"\n  [dim]{scroll+1}-{min(scroll+15, len(results))}"
+                          f" of {len(results)}[/]")
+            best = results[0] if results else None
+            if best and best.speed > 0:
+                console.print(f"\n  [bold green]Fastest: {best.ip}:{best.port}"
+                              f" — {best.speed:.0f} KB/s[/]")
+
+            console.print(f"\n  [dim]\\[c] copy fastest  \\[1] sort speed  "
+                          f"\\[2] sort avg  \\[↑/↓] scroll  \\[q] back[/]")
+
+            k = _read_key()
+            if k == "UP": scroll = max(0, scroll - 1)
+            elif k == "DOWN": scroll = min(max(0, len(results) - 15), scroll + 1)
+            elif k in ("c", "C"):
+                if results:
+                    if copy_clip(results[0].ip):
+                        self._flash(f"{GRN}✓ Copied {results[0].ip} "
+                                    f"({results[0].speed:.0f} KB/s){RST}")
+                    else:
+                        self._flash(f"{RED}Clipboard not available{RST}")
+            elif k == "1":
+                results.sort(key=lambda r: -r.speed); scroll = 0
+            elif k == "2":
+                results.sort(key=lambda r: r.avg if r.avg > 0 else 9e9); scroll = 0
             elif k in ("q", "Q", "ESC"): return
 
     # ── Geolocation ────────────────────────────────────────────────
